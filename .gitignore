@@ -1,0 +1,17 @@
+# secrets
+.env
+.env.*
+
+# python
+__pycache__/
+.venv/
+.pytest_cache/
+
+# deepeval local caches
+.deepeval/
+
+# node
+node_modules/
+dist/
+
+.DS_Store

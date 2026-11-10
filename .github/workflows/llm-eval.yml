@@ -1,0 +1,80 @@
+# On every pull request, check that content_hash in prompts/*.json matches
+# the hashes generated from the template, shots, and knowledge base.
+# On pull requests that change backend/app/llm/versions/<bot>.json (the live prompt version),
+# also run that bot's eval backend/app/llm/tests/test_<bot>.py (rule check + Correctness + Faithfulness).
+name: LLM Eval
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  prompt-hashes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      # Standard library only, so no dependency install is needed
+      - name: Compare registry hashes with generated hashes
+        run: python3 -m app.llm.commands.update_hashes --check
+
+  evaluate:
+    # Don't spend API calls evaluating a registry whose hashes are stale
+    needs: prompt-hashes
+    runs-on: ubuntu-latest
+    # 57 cases x (1 bot call + several judge calls). Faithfulness reads the whole knowledge base each time, so 10 minutes is not enough
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Detect and evaluate changed bots
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          # Find bots whose version changed (:/ = relative to the repo root, since this step runs in backend/)
+          mapfile -t versions < <(
+            git diff --name-only --diff-filter=AM \
+              "$BASE_SHA...$HEAD_SHA" \
+              -- ':/backend/app/llm/versions/*.json'
+          )
+
+          if [ "${#versions[@]}" -eq 0 ]; then
+            echo "No bot version changes. Skipping evaluation."
+            exit 0
+          fi
+
+          tests=()
+          for version in "${versions[@]}"; do
+            bot=$(basename "$version" .json)
+            test="app/llm/tests/test_${bot}.py"
+            if [ ! -f "$test" ]; then
+              echo "::error file=$version::eval $test for $bot not found"
+              exit 1
+            fi
+            echo "$bot: version $(jq -r .version "../$version")"
+            tests+=("$test")
+          done
+
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY secret is not set"
+            exit 1
+          fi
+
+          uv sync --frozen
+          uv run deepeval test run "${tests[@]}" -n 8
